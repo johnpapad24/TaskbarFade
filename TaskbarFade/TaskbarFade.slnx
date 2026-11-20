@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="TaskbarFade/TaskbarFade.vcxproj" />
+  <Project Path="TaskbarFade/TaskbarFade.vcxproj" Id="42875de8-0666-46fa-89ab-59a38ee3238f" />
 </Solution>

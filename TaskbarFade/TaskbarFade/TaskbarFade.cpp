@@ -15,10 +15,14 @@
 // separate click-through window right behind it, so icon opacity and taskbar opacity are independent.
 //
 // Build with MSVC (Start menu > "x64 Native Tools Command Prompt for VS", cd to this folder):
-//   cl /O2 /EHsc TaskbarFade.cpp /link /SUBSYSTEM:WINDOWS
+//   rc TaskbarFade.rc
+//   cl /O2 /EHsc TaskbarFade.cpp TaskbarFade.res /link /SUBSYSTEM:WINDOWS
 // Build with MinGW-w64:
-//   g++ -O2 -mwindows -static TaskbarFade.cpp -o TaskbarFade.exe -luser32 -lshell32 -ladvapi32 -lcomdlg32 -lgdi32
-// In the Visual Studio IDE, add this file to an Empty Project or a Console App project; both link.
+//   windres TaskbarFade.rc -O coff -o TaskbarFade_res.o
+//   g++ -O2 -mwindows -static TaskbarFade.cpp TaskbarFade_res.o -o TaskbarFade.exe -luser32 -lshell32 -ladvapi32 -lcomdlg32 -lgdi32
+// TaskbarFade.rc embeds TaskbarFade.ico as the program icon. You can skip the rc/windres step and the .res/.o file:
+// the tray icon is then drawn by the program itself and only the .exe's own file icon stays generic.
+// In the Visual Studio IDE, add this file (and TaskbarFade.rc) to an Empty Project or a Console App project; both link.
 
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00                   // Windows 10
@@ -27,6 +31,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <commdlg.h>
+#include <math.h>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
@@ -435,6 +440,75 @@ static LRESULT CALLBACK BackProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ---- Tray icon + window ------------------------------------------------------
+// ---- Program icon ------------------------------------------------------------
+// TaskbarFade.rc embeds TaskbarFade.ico (resource 1). If that wasn't compiled in, the same design is drawn here:
+// a taskbar that fades from opaque on the left to see-through on the right, with three app icons that fade too.
+static float Clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+static float RoundBox(float px, float py, float cx, float cy, float hw, float hh, float r) {   // signed distance to a rounded box
+    float dx = fabsf(px - cx) - (hw - r), dy = fabsf(py - cy) - (hh - r);
+    float ox = dx > 0 ? dx : 0, oy = dy > 0 ? dy : 0;
+    float inner = dx > dy ? dx : dy;
+    return sqrtf(ox * ox + oy * oy) + (inner < 0 ? inner : 0) - r;
+}
+
+static float IconFade(float u) { return Clamp01(1.0f - 0.65f * (u - 0.06f) / 0.88f); }   // 1 at the left end, 0.35 at the right
+
+static unsigned IconPixel(int n, int x, int y) {                  // one pixel of an n*n icon, as premultiplied 0xAARRGGBB
+    const float blue[3] = { 47 / 255.0f, 155 / 255.0f, 1.0f };    // the taskbar; the app icons are white
+    float u = (x + 0.5f) / n, v = (y + 0.5f) / n;
+    float bar = Clamp01(0.5f - RoundBox(u, v, 0.5f, 0.64f, 0.44f, 0.24f, 0.12f) * n) * IconFade(u);
+    float dot = 0;
+    for (int i = 0; i < 3; i++) {
+        float cx = 0.24f + 0.26f * i;
+        float d = Clamp01(0.5f - RoundBox(u, v, cx, 0.64f, 0.08f, 0.08f, 0.04f) * n) * IconFade(cx);
+        if (d > dot) dot = d;
+    }
+    float a = dot + bar * (1 - dot);                              // white icons over the blue bar
+    unsigned r = (unsigned)((dot + blue[0] * bar * (1 - dot)) * 255 + 0.5f);
+    unsigned g = (unsigned)((dot + blue[1] * bar * (1 - dot)) * 255 + 0.5f);
+    unsigned b = (unsigned)((dot + blue[2] * bar * (1 - dot)) * 255 + 0.5f);
+    return ((unsigned)(a * 255 + 0.5f) << 24) | (r << 16) | (g << 8) | b;
+}
+// (end of the icon drawing maths)
+
+static HICON MakeIcon(int n) {
+    if (n > 64) n = 64;
+    static const unsigned char zeros[8 * 64] = {};                // all-zero 1-bit mask: the alpha channel does the work
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = n;
+    bi.bmiHeader.biHeight = -n;                                   // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    unsigned* px = nullptr;
+    HBITMAP color = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, (void**)&px, nullptr, 0);
+    HBITMAP mask = CreateBitmap(n, n, 1, 1, zeros);
+    HICON icon = nullptr;
+    if (color && mask && px) {
+        for (int y = 0; y < n; y++)
+            for (int x = 0; x < n; x++) px[y * n + x] = IconPixel(n, x, y);
+        ICONINFO ii = {};
+        ii.fIcon = TRUE;
+        ii.hbmMask = mask;
+        ii.hbmColor = color;
+        icon = CreateIconIndirect(&ii);
+    }
+    if (color) DeleteObject(color);
+    if (mask) DeleteObject(mask);
+    return icon;
+}
+
+static HICON LoadAppIcon() {
+    int n = GetSystemMetrics(SM_CXSMICON);                        // the size the tray wants (16 at 100% scaling)
+    if (n < 16) n = 16;
+    HICON icon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, n, n, LR_DEFAULTCOLOR);
+    if (!icon) icon = MakeIcon(n);                                // no resource compiled in: draw the same design
+    if (!icon) icon = LoadIconW(nullptr, IDI_APPLICATION);
+    return icon;
+}
+
 static void PickColor(HWND owner) {
     static COLORREF custom[16];
     CHOOSECOLORW cc = {};
@@ -544,6 +618,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(h, 1);
         RestoreAll();
         Shell_NotifyIconW(NIM_DELETE, &gNid);
+        DestroyIcon(gNid.hIcon);
         PostQuitMessage(0);
         return 0;
     }
@@ -600,7 +675,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int) {
     gNid.uID = 1;
     gNid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     gNid.uCallbackMessage = WM_TRAY;
-    gNid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    gNid.hIcon = LoadAppIcon();
     lstrcpyW(gNid.szTip, L"TaskbarFade");
     Shell_NotifyIconW(NIM_ADD, &gNid);
 
